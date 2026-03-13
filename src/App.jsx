@@ -16,6 +16,7 @@ const TABS = [
   { id: "game",     label: "試合",    icon: "🏀" },
   { id: "analysis", label: "解析",    icon: "🧠" },
   { id: "growth",   label: "成長",    icon: "📈" },
+  { id: "manage",   label: "管理",    icon: "⚙️" },
 ];
 
 // ==================== STORAGE (localStorage) ====================
@@ -891,6 +892,322 @@ function GrowthTab({ games, sessions }) {
   );
 }
 
+// ==================== MANAGE TAB ====================
+// CSV・PDF出力はすべてブラウザ内で完結（サーバー不要）
+// PDF は新規ウィンドウで日本語HTMLを生成 → ブラウザのPDF印刷を使用（文字化けなし）
+
+function downloadFile(filename, blobContent, mimeType) {
+  const blob = new Blob([blobContent], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function toCSV(rows, headers) {
+  const escape = v => `"${String(v ?? "").replace(/"/g, '""')}"`; 
+  return [headers.map(escape), ...rows.map(r => r.map(escape))].join("\n");
+}
+
+function buildPdfHtml(practices, games, sessions) {
+  const today = new Date().toLocaleDateString("ja-JP", { year: "numeric", month: "long", day: "numeric" });
+  const avgShootRate = games.length
+    ? Math.round(games.reduce((a, g) => a + g.shotsMade / (g.shots || 1), 0) / games.length * 100) : null;
+  const avg = key => games.length
+    ? (games.reduce((a, g) => a + (g[key] || 0), 0) / games.length).toFixed(1) : "-";
+  const monthTotal = sessions
+    .filter(s => (Date.now() - new Date(s.date)) / 86400000 <= 30)
+    .reduce((a, s) => a + (s.duration || 0), 0);
+
+  const th = s => `<th>${s}</th>`;
+  const td = s => `<td>${s ?? "-"}</td>`;
+  const tr = cols => `<tr>${cols.map(td).join("")}</tr>`;
+
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Basketball Tracker レポート</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "Noto Sans JP", sans-serif; font-size: 11pt; color: #1e293b; background: white; padding: 0; }
+  .page { max-width: 210mm; margin: 0 auto; padding: 12mm 14mm; }
+
+  /* ヘッダー */
+  .header { background: linear-gradient(135deg,#f97316,#ea580c); color: white; padding: 12px 16px; border-radius: 8px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+  .header h1 { font-size: 16pt; font-weight: 900; }
+  .header .date { font-size: 9pt; opacity: 0.9; }
+
+  /* サマリーカード */
+  .summary { display: grid; grid-template-columns: repeat(4,1fr); gap: 10px; margin-bottom: 20px; }
+  .summary-card { background: #f8fafc; border-radius: 8px; padding: 10px 12px; text-align: center; border: 1px solid #e2e8f0; }
+  .summary-card .val { font-size: 18pt; font-weight: 900; color: #f97316; }
+  .summary-card .lbl { font-size: 8pt; color: #94a3b8; margin-top: 2px; }
+
+  /* セクション */
+  .section { margin-bottom: 20px; }
+  .section-title { background: #f1f5f9; padding: 6px 12px; border-left: 4px solid #f97316; font-size: 11pt; font-weight: 700; margin-bottom: 10px; border-radius: 0 6px 6px 0; }
+
+  /* テーブル */
+  table { width: 100%; border-collapse: collapse; font-size: 9pt; }
+  thead tr { background: #f97316; color: white; }
+  th { padding: 6px 8px; text-align: left; font-weight: 700; }
+  td { padding: 5px 8px; border-bottom: 1px solid #f1f5f9; }
+  tr:nth-child(even) td { background: #f8fafc; }
+
+  /* フッター */
+  .footer { text-align: center; font-size: 8pt; color: #94a3b8; margin-top: 24px; padding-top: 10px; border-top: 1px solid #e2e8f0; }
+
+  /* 印刷用 */
+  @media print {
+    body { padding: 0; }
+    .page { padding: 8mm 10mm; }
+    .no-print { display: none !important; }
+  }
+
+  /* 印刷ボタン */
+  .print-bar { position: fixed; bottom: 20px; right: 20px; display: flex; gap: 10px; z-index: 999; }
+  .print-btn { padding: 12px 24px; background: linear-gradient(135deg,#f97316,#ea580c); color: white; border: none; border-radius: 12px; font-size: 14px; font-weight: 700; cursor: pointer; font-family: "Noto Sans JP",sans-serif; box-shadow: 0 4px 16px rgba(249,115,22,0.4); }
+  .close-btn { padding: 12px 20px; background: #1e293b; color: white; border: none; border-radius: 12px; font-size: 14px; font-weight: 700; cursor: pointer; font-family: "Noto Sans JP",sans-serif; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <h1>🏀 Basketball Tracker レポート</h1>
+    <div class="date">${today}</div>
+  </div>
+
+  <!-- サマリー -->
+  <div class="summary">
+    <div class="summary-card"><div class="val">${games.length}</div><div class="lbl">試合数</div></div>
+    <div class="summary-card"><div class="val">${avgShootRate !== null ? avgShootRate + "%" : "—"}</div><div class="lbl">平均シュート率</div></div>
+    <div class="summary-card"><div class="val">${sessions.length}</div><div class="lbl">総練習回数</div></div>
+    <div class="summary-card"><div class="val">${monthTotal}</div><div class="lbl">今月の練習(分)</div></div>
+  </div>
+
+  ${practices.length ? `
+  <!-- 練習メニュー -->
+  <div class="section">
+    <div class="section-title">⚡ 練習メニュー</div>
+    <table>
+      <thead><tr>${["練習名","カテゴリ","時間","本数"].map(th).join("")}</tr></thead>
+      <tbody>
+        ${practices.map(p => tr([p.label, typeLabels[p.type], p.duration ? p.duration + "分" : "-", p.reps ? p.reps + "本" : "-"])).join("")}
+      </tbody>
+    </table>
+  </div>` : ""}
+
+  ${games.length ? `
+  <!-- 試合記録 -->
+  <div class="section">
+    <div class="section-title">🏀 試合記録</div>
+    <table>
+      <thead><tr>${["日付","出場時間","シュート数","成功数","成功率","アシスト","ブロック","リバウンド","スティール"].map(th).join("")}</tr></thead>
+      <tbody>
+        ${games.map(g => {
+          const rate = Math.round((g.shotsMade / (g.shots || 1)) * 100);
+          return tr([g.date, g.playTime + "分", g.shots, g.shotsMade, rate + "%", g.assists, g.blocks, g.rebounds, g.steals]);
+        }).join("")}
+      </tbody>
+    </table>
+    <div style="margin-top:10px;padding:8px 12px;background:#fff7ed;border-radius:6px;font-size:9pt;">
+      <strong style="color:#f97316">平均スタッツ：</strong>
+      出場 ${avg("playTime")}分 ／ シュート率 ${avgShootRate}% ／ アシスト ${avg("assists")} ／ リバウンド ${avg("rebounds")} ／ ブロック ${avg("blocks")} ／ スティール ${avg("steals")}
+    </div>
+  </div>` : ""}
+
+  ${sessions.length ? `
+  <!-- 練習セッション -->
+  <div class="section">
+    <div class="section-title">⏱ 練習セッション（直近30件）</div>
+    <table>
+      <thead><tr>${["日付","練習時間"].map(th).join("")}</tr></thead>
+      <tbody>
+        ${sessions.slice(0, 30).map(s => tr([s.date, s.duration + "分"])).join("")}
+      </tbody>
+    </table>
+    <div style="margin-top:8px;padding:6px 12px;background:#fff7ed;border-radius:6px;font-size:9pt;">
+      <strong style="color:#f97316">合計：</strong>${sessions.reduce((a,s)=>a+(s.duration||0),0)}分 ／ ${sessions.length}回
+    </div>
+  </div>` : ""}
+
+  <div class="footer">Basketball Tracker &nbsp;|&nbsp; ${today} 出力</div>
+</div>
+
+<div class="print-bar no-print">
+  <button class="close-btn" onclick="window.close()">✕ 閉じる</button>
+  <button class="print-btn" onclick="window.print()">🖨 PDFとして保存</button>
+</div>
+</body>
+</html>`;
+}
+
+function ManageTab({ practices, games, sessions, setPractices, setGames, setSessions }) {
+  const [exporting, setExporting] = useState(null);
+  const [confirmClear, setConfirmClear] = useState(null); // "games"|"sessions"|"practices"|"all"
+
+  // ---- CSV エクスポート ----
+  const exportCSV = (type) => {
+    const today = new Date().toISOString().split("T")[0];
+    if (type === "games") {
+      if (!games.length) return alert("試合記録がありません");
+      const headers = ["日付","出場時間(分)","シュート数","成功数","成功率(%)","アシスト","ブロック","リバウンド","スティール","パスミス","プレイミス"];
+      const rows = games.map(g => [
+        g.date, g.playTime, g.shots, g.shotsMade,
+        Math.round((g.shotsMade / (g.shots || 1)) * 100),
+        g.assists, g.blocks, g.rebounds, g.steals, g.passMiss, g.playMiss,
+      ]);
+      downloadFile(`games_${today}.csv`, "\uFEFF" + toCSV(rows, headers), "text/csv;charset=utf-8");
+    }
+    if (type === "sessions") {
+      if (!sessions.length) return alert("練習セッションがありません");
+      const headers = ["日付","練習時間(分)"];
+      const rows = sessions.map(s => [s.date, s.duration]);
+      downloadFile(`sessions_${today}.csv`, "\uFEFF" + toCSV(rows, headers), "text/csv;charset=utf-8");
+    }
+    if (type === "practices") {
+      if (!practices.length) return alert("練習メニューがありません");
+      const headers = ["練習名","カテゴリ","時間(分)","本数"];
+      const rows = practices.map(p => [p.label, typeLabels[p.type], p.duration ?? "", p.reps ?? ""]);
+      downloadFile(`menu_${today}.csv`, "\uFEFF" + toCSV(rows, headers), "text/csv;charset=utf-8");
+    }
+  };
+
+  // ---- PDF エクスポート（新規ウィンドウでHTML生成 → ブラウザのPDF印刷）----
+  const exportPDF = () => {
+    if (!games.length && !sessions.length && !practices.length) {
+      return alert("出力するデータがありません");
+    }
+    const html = buildPdfHtml(practices, games, sessions);
+    const win = window.open("", "_blank");
+    if (!win) return alert("ポップアップがブロックされています。許可してから再試行してください。");
+    win.document.write(html);
+    win.document.close();
+  };
+
+  // ---- データ削除 ----
+  const clearData = async (type) => {
+    if (type === "games" || type === "all") { setGames([]); await DB.set("games", []); }
+    if (type === "sessions" || type === "all") { setSessions([]); await DB.set("sessions", []); }
+    if (type === "practices" || type === "all") { setPractices([]); await DB.set("practices", []); }
+    setConfirmClear(null);
+  };
+
+  const ActionBtn = ({ icon, label, sub, onClick, color = "orange", disabled = false }) => {
+    const bg = color === "red"
+      ? "linear-gradient(135deg,#ef4444,#dc2626)"
+      : "linear-gradient(135deg,#f97316,#ea580c)";
+    return (
+      <button onClick={onClick} disabled={disabled} style={{
+        display: "flex", alignItems: "center", gap: 14, width: "100%",
+        padding: "14px 16px", background: disabled ? "#f1f5f9" : "white",
+        border: `1px solid ${color === "red" ? "#fecaca" : "#e2e8f0"}`,
+        borderRadius: 14, cursor: disabled ? "not-allowed" : "pointer",
+        textAlign: "left", opacity: disabled ? 0.6 : 1,
+      }}>
+        <div style={{
+          width: 40, height: 40, borderRadius: 12, flexShrink: 0,
+          background: disabled ? "#e2e8f0" : bg,
+          display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18,
+        }}>{icon}</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: color === "red" ? "#ef4444" : "#1e293b" }}>{label}</div>
+          <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 2 }}>{sub}</div>
+        </div>
+      </button>
+    );
+  };
+
+  // 確認ダイアログ
+  const ConfirmDialog = ({ type, label, onConfirm, onCancel }) => (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 1000,
+      display: "flex", alignItems: "center", justifyContent: "center", padding: 24,
+    }}>
+      <div style={{ background: "white", borderRadius: 20, padding: 24, maxWidth: 320, width: "100%" }}>
+        <div style={{ fontSize: 32, textAlign: "center", marginBottom: 12 }}>⚠️</div>
+        <h3 style={{ fontSize: 15, fontWeight: 800, color: "#1e293b", textAlign: "center", marginBottom: 8 }}>
+          本当に削除しますか？
+        </h3>
+        <p style={{ fontSize: 13, color: "#64748b", textAlign: "center", marginBottom: 20 }}>
+          「{label}」を削除します。<br />この操作は元に戻せません。
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <button onClick={onCancel} style={{
+            padding: "12px 0", background: "#f1f5f9", border: "none", borderRadius: 12,
+            fontWeight: 700, fontSize: 14, cursor: "pointer", color: "#64748b",
+          }}>キャンセル</button>
+          <button onClick={onConfirm} style={{
+            padding: "12px 0", background: "linear-gradient(135deg,#ef4444,#dc2626)",
+            border: "none", borderRadius: 12, fontWeight: 700, fontSize: 14,
+            cursor: "pointer", color: "white",
+          }}>削除する</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  const clearLabels = {
+    games: "試合記録", sessions: "練習セッション", practices: "練習メニュー", all: "全データ",
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, width: "100%" }}>
+      {confirmClear && (
+        <ConfirmDialog
+          type={confirmClear}
+          label={clearLabels[confirmClear]}
+          onConfirm={() => clearData(confirmClear)}
+          onCancel={() => setConfirmClear(null)}
+        />
+      )}
+
+      {/* PDF */}
+      <Card>
+        <h2 style={{ fontSize: 15, fontWeight: 800, color: "#1e293b", marginBottom: 4 }}>📄 PDF レポート</h2>
+        <p style={{ fontSize: 12, color: "#94a3b8", marginBottom: 14 }}>
+          新規タブでレポートを開き、ブラウザの「PDFとして保存」で保存。日本語も正しく表示されます。
+        </p>
+        <ActionBtn icon="📄" label="PDFプレビューを開く" sub="全データをA4レポートで表示 → 印刷ダイアログからPDF保存" onClick={exportPDF} />
+      </Card>
+
+      {/* CSV */}
+      <Card>
+        <h2 style={{ fontSize: 15, fontWeight: 800, color: "#1e293b", marginBottom: 4 }}>📊 CSV エクスポート</h2>
+        <p style={{ fontSize: 12, color: "#94a3b8", marginBottom: 14 }}>
+          Excel・スプレッドシートで開けるCSV形式（UTF-8 BOM付き）
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <ActionBtn icon="🏀" label="試合記録 CSV" sub={`${games.length}件`} onClick={() => exportCSV("games")} disabled={!games.length} />
+          <ActionBtn icon="⚡" label="練習セッション CSV" sub={`${sessions.length}件`} onClick={() => exportCSV("sessions")} disabled={!sessions.length} />
+          <ActionBtn icon="📋" label="練習メニュー CSV" sub={`${practices.length}件`} onClick={() => exportCSV("practices")} disabled={!practices.length} />
+        </div>
+      </Card>
+
+      {/* データ削除 */}
+      <Card>
+        <h2 style={{ fontSize: 15, fontWeight: 800, color: "#ef4444", marginBottom: 4 }}>🗑 データ削除</h2>
+        <p style={{ fontSize: 12, color: "#94a3b8", marginBottom: 14 }}>
+          削除したデータは復元できません。CSVでバックアップしてから実行してください。
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <ActionBtn icon="🏀" label="試合記録を削除" sub={`${games.length}件を削除`} onClick={() => setConfirmClear("games")} color="red" disabled={!games.length} />
+          <ActionBtn icon="⚡" label="練習セッションを削除" sub={`${sessions.length}件を削除`} onClick={() => setConfirmClear("sessions")} color="red" disabled={!sessions.length} />
+          <ActionBtn icon="📋" label="練習メニューを削除" sub={`${practices.length}件を削除`} onClick={() => setConfirmClear("practices")} color="red" disabled={!practices.length} />
+          <ActionBtn icon="💥" label="全データを削除" sub="すべてリセット" onClick={() => setConfirmClear("all")} color="red" disabled={!games.length && !sessions.length && !practices.length} />
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 // ==================== MAIN APP ====================
 export default function App() {
   const [activeTab, setActiveTab] = useState("home");
@@ -945,6 +1262,7 @@ export default function App() {
       case "game":      return <GameTab games={games} setGames={setGames} />;
       case "analysis":  return <AnalysisTab />;
       case "growth":    return <GrowthTab games={games} sessions={sessions} />;
+      case "manage":    return <ManageTab practices={practices} games={games} sessions={sessions} setPractices={setPractices} setGames={setGames} setSessions={setSessions} />;
       default: return null;
     }
   };
