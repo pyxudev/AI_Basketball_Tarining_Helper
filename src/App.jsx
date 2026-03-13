@@ -156,16 +156,33 @@ function HomeTab({ practices, onSessionSave }) {
   const [aiComment, setAiComment] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [saved, setSaved] = useState(false);
-  const ref = useRef(null);
+  const startTimeRef = useRef(null); // 開始時刻をDate.now()で記録
+  const tickRef = useRef(null);
 
   const totalMin = practices.reduce((a, p) => a + (p.duration || 0), 0);
   const fmt = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
+  // visibilitychange: 画面ロック復帰時に経過時間を再計算
+  useEffect(() => {
+    const onVisible = () => {
+      if (active && startTimeRef.current) {
+        const secs = Math.floor((Date.now() - startTimeRef.current) / 1000);
+        setElapsed(secs);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [active]);
+
   const start = async () => {
     setSaved(false);
+    startTimeRef.current = Date.now();
     setActive(true);
     setElapsed(0);
-    ref.current = setInterval(() => setElapsed(e => e + 1), 1000);
+    // setIntervalはUI更新用。止まっても復帰時にvisibilitychangeで補正される
+    tickRef.current = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000));
+    }, 1000);
     if (practices.length > 0) {
       setAiLoading(true);
       const menu = practices.map(p => `${p.label}: ${p.duration ? p.duration + "分" : p.reps + "本"}`).join(", ");
@@ -179,10 +196,15 @@ function HomeTab({ practices, onSessionSave }) {
   };
 
   const stop = async () => {
-    clearInterval(ref.current);
+    clearInterval(tickRef.current);
+    // 停止時も開始時刻から正確に計算
+    const finalSecs = startTimeRef.current
+      ? Math.floor((Date.now() - startTimeRef.current) / 1000)
+      : elapsed;
     setActive(false);
-    if (elapsed > 0) {
-      await onSessionSave({ duration: Math.round(elapsed / 60), date: new Date().toISOString().split("T")[0] });
+    if (finalSecs > 0) {
+      await onSessionSave({ duration: Math.round(finalSecs / 60), date: new Date().toISOString().split("T")[0] });
+      setElapsed(finalSecs);
       setSaved(true);
     }
   };
@@ -380,9 +402,35 @@ function DashboardTab({ practices, games, sessions }) {
 }
 
 // ==================== PRACTICE TAB ====================
+// ==================== PRACTICE FORM FIELDS (must be top-level to avoid remount) ====================
+function PracticeFormFields({ values, onChange, onSave, onCancel, saveLabel }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <select value={values.type} onChange={e => onChange(f => ({ ...f, type: e.target.value }))} style={INP}>
+        {Object.entries(typeLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+      </select>
+      <input placeholder="練習名（例: ドリブル基礎）" value={values.label}
+        onChange={e => onChange(f => ({ ...f, label: e.target.value }))} style={INP} />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <input placeholder="時間（分）" type="number" min="0" value={values.duration}
+          onChange={e => onChange(f => ({ ...f, duration: e.target.value }))} style={INP} />
+        <input placeholder="本数（本）" type="number" min="0" value={values.reps}
+          onChange={e => onChange(f => ({ ...f, reps: e.target.value }))} style={INP} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <Btn onClick={onSave} disabled={!values.label.trim()}>{saveLabel}</Btn>
+        <Btn onClick={onCancel} variant="ghost">キャンセル</Btn>
+      </div>
+    </div>
+  );
+}
+
 function PracticeTab({ practices, setPractices }) {
+  const emptyForm = { type: "shoot", label: "", duration: "", reps: "" };
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ type: "shoot", label: "", duration: "", reps: "" });
+  const [form, setForm] = useState(emptyForm);
+  const [editId, setEditId] = useState(null); // 編集中のアイテムID
+  const [editForm, setEditForm] = useState(null);
   const [aiAnalysis, setAiAnalysis] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
 
@@ -397,14 +445,48 @@ function PracticeTab({ practices, setPractices }) {
     const next = [...practices, item];
     setPractices(next);
     await DB.set("practices", next);
-    setForm({ type: "shoot", label: "", duration: "", reps: "" });
+    setForm(emptyForm);
     setShowAdd(false);
   };
+
+  const startEdit = (p) => {
+    setEditId(p.id);
+    setEditForm({
+      type: p.type,
+      label: p.label,
+      duration: p.duration != null ? String(p.duration) : "",
+      reps: p.reps != null ? String(p.reps) : "",
+    });
+    setShowAdd(false);
+  };
+
+  const saveEdit = async () => {
+    if (!editForm.label.trim()) return;
+    const next = practices.map(p =>
+      p.id === editId
+        ? {
+            ...p,
+            type: editForm.type,
+            label: editForm.label.trim(),
+            duration: editForm.duration ? parseInt(editForm.duration) : null,
+            reps: editForm.reps ? parseInt(editForm.reps) : null,
+            color: typeColors[editForm.type],
+          }
+        : p
+    );
+    setPractices(next);
+    await DB.set("practices", next);
+    setEditId(null);
+    setEditForm(null);
+  };
+
+  const cancelEdit = () => { setEditId(null); setEditForm(null); };
 
   const remove = async (id) => {
     const next = practices.filter(p => p.id !== id);
     setPractices(next);
     await DB.set("practices", next);
+    if (editId === id) cancelEdit();
   };
 
   const analyze = async () => {
@@ -424,7 +506,7 @@ function PracticeTab({ practices, setPractices }) {
       <Card>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
           <h2 style={{ fontSize: 15, fontWeight: 800, color: "#1e293b" }}>⚡ 練習メニュー</h2>
-          <button onClick={() => setShowAdd(!showAdd)} style={{
+          <button onClick={() => { setShowAdd(!showAdd); cancelEdit(); }} style={{
             padding: "8px 14px", background: showAdd ? "#f1f5f9" : "#fff7ed",
             border: `1px solid ${showAdd ? "#e2e8f0" : "#fed7aa"}`,
             borderRadius: 10, color: showAdd ? "#64748b" : "#f97316", fontWeight: 700, fontSize: 13, cursor: "pointer",
@@ -433,41 +515,57 @@ function PracticeTab({ practices, setPractices }) {
           </button>
         </div>
 
+        {/* 追加フォーム */}
         {showAdd && (
           <div style={{ background: "#f8fafc", borderRadius: 14, padding: 16, marginBottom: 16, border: "1px solid #e2e8f0" }}>
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <select value={form.type} onChange={e => setForm(f => ({ ...f, type: e.target.value }))} style={INP}>
-                {Object.entries(typeLabels).map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-              </select>
-              <input placeholder="練習名（例: ドリブル基礎）" value={form.label}
-                onChange={e => setForm(f => ({ ...f, label: e.target.value }))} style={INP} />
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-                <input placeholder="時間（分）" type="number" min="0" value={form.duration}
-                  onChange={e => setForm(f => ({ ...f, duration: e.target.value }))} style={INP} />
-                <input placeholder="本数（本）" type="number" min="0" value={form.reps}
-                  onChange={e => setForm(f => ({ ...f, reps: e.target.value }))} style={INP} />
-              </div>
-              <Btn onClick={add} disabled={!form.label.trim()}>💾 保存</Btn>
-            </div>
+            <PracticeFormFields
+              values={form} onChange={setForm}
+              onSave={add} onCancel={() => setShowAdd(false)}
+              saveLabel="💾 追加"
+            />
           </div>
         )}
 
         {practices.length === 0
           ? <Empty icon="⚡" text="メニューを追加して練習を管理しましょう" />
           : practices.map(p => (
-            <div key={p.id} style={{
-              display: "flex", alignItems: "center", gap: 12, marginBottom: 10,
-              padding: "12px 14px", background: "#f8fafc", borderRadius: 14, border: "1px solid #e2e8f0",
-            }}>
-              <div style={{ width: 10, height: 40, borderRadius: 999, flexShrink: 0, background: `linear-gradient(180deg,${p.color},${p.color}88)` }} />
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div style={{ fontWeight: 700, color: "#1e293b", fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.label}</div>
-                <div style={{ fontSize: 11, color: "#94a3b8" }}>{typeLabels[p.type]}</div>
-              </div>
-              <span style={{ fontWeight: 800, color: "#f97316", fontSize: 16, flexShrink: 0 }}>
-                {p.duration ? `${p.duration}分` : `${p.reps}本`}
-              </span>
-              <button onClick={() => remove(p.id)} style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 16, padding: 4, flexShrink: 0 }}>✕</button>
+            <div key={p.id} style={{ marginBottom: 10 }}>
+              {/* 編集フォーム（展開表示） */}
+              {editId === p.id ? (
+                <div style={{ background: "#fff7ed", borderRadius: 14, padding: 16, border: "1px solid #fed7aa" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#f97316", marginBottom: 10 }}>✏️ 編集中: {p.label}</div>
+                  <PracticeFormFields
+                    values={editForm} onChange={setEditForm}
+                    onSave={saveEdit} onCancel={cancelEdit}
+                    saveLabel="✅ 保存"
+                  />
+                  <button onClick={() => remove(p.id)} style={{
+                    marginTop: 10, width: "100%", padding: "8px 0", background: "none",
+                    border: "1px solid #fecaca", borderRadius: 10,
+                    color: "#ef4444", fontWeight: 700, fontSize: 13, cursor: "pointer",
+                  }}>🗑 削除</button>
+                </div>
+              ) : (
+                /* 通常表示 */
+                <div style={{
+                  display: "flex", alignItems: "center", gap: 12,
+                  padding: "12px 14px", background: "#f8fafc", borderRadius: 14, border: "1px solid #e2e8f0",
+                }}>
+                  <div style={{ width: 10, height: 40, borderRadius: 999, flexShrink: 0, background: `linear-gradient(180deg,${p.color},${p.color}88)` }} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontWeight: 700, color: "#1e293b", fontSize: 14, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.label}</div>
+                    <div style={{ fontSize: 11, color: "#94a3b8" }}>{typeLabels[p.type]}</div>
+                  </div>
+                  <span style={{ fontWeight: 800, color: "#f97316", fontSize: 16, flexShrink: 0 }}>
+                    {p.duration ? `${p.duration}分` : `${p.reps}本`}
+                  </span>
+                  {/* 編集ボタン */}
+                  <button onClick={() => startEdit(p)} style={{
+                    background: "none", border: "1px solid #e2e8f0", borderRadius: 8,
+                    color: "#64748b", cursor: "pointer", fontSize: 13, padding: "4px 8px", flexShrink: 0,
+                  }}>✏️</button>
+                </div>
+              )}
             </div>
           ))
         }
